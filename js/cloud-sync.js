@@ -1,26 +1,21 @@
 /**
- * cloud-sync.js v2 — Supabase 跨设备同步（安全版）
+ * cloud-sync.js v3 — Supabase 跨设备同步（安全版 + 可见同步按钮）
  *
- * 关键改进：不再是“打开就用云端覆盖本地”，而是按时间戳合并——
- *   - 每个键记录本地最后修改时间；
- *   - 拉云端时，只有“云端比本地更新”才覆盖本地，否则保留本地；
- *   - 本地比云端新（或云端没有）的键，自动推上去。
- * 因此刷新永远不会把你现有的数据清空。
- *
- * 同步码：手机和电脑填同一个即可。本项目统一用 jlin47（或你自定义的长码）。
+ * 在 v2「按时间戳合并、绝不用旧数据覆盖新数据」基础上，新增：
+ *   - 右下角一个「☁」按钮：点一下强制把本机数据上传，结果（成功条数/错误）直接显示在屏幕上；
+ *   - 页面切到后台时，立即把待上传的改动推一次（尽量避免手机锁屏掐断）；
+ *   - 上传失败会弹出可见提示，方便排查。
  */
 (function () {
   'use strict';
 
-  /* ===== Supabase 配置（已填好） ===== */
   var SUPABASE_URL = 'https://cmvakkjftojjkiifhiqj.supabase.co';
   var SUPABASE_ANON_KEY = 'sb_publishable_f2icS_s9Vvss1Q1MrM_sTg_g47g42oO';
   var TABLE = 'milk_sync';
-  /* ================================= */
 
   var PREFIX = window.APP_PREFIX || 'CHAT_APP_V3_';
   var SYNC_CODE_KEY = 'MILK_SYNC_CODE';
-  var META_KEY = 'MILK_SYNC_META';      // localStorage: { 键: ISO时间 } 本地各键最后修改时间
+  var META_KEY = 'MILK_SYNC_META';
 
   if (SUPABASE_URL.indexOf('YOUR-PROJECT') !== -1 || !window.supabase) {
     console.warn('[cloud-sync] 未配置或 SDK 未加载，纯本地模式'); return;
@@ -38,7 +33,6 @@
   function nowIso() { return new Date().toISOString(); }
   function syncable(k) { return typeof k === 'string' && k.indexOf(PREFIX) === 0; }
 
-  /* ---------- 同步码 ---------- */
   function ensureSyncCode() {
     if (!syncCode) {
       var c = window.prompt('请输入「同步码」（手机和电脑填同一个，例如 jlin47）：', '');
@@ -49,7 +43,6 @@
   window.setSyncCode = function (c) { syncCode = (c || '').trim(); localStorage.setItem(SYNC_CODE_KEY, syncCode); location.reload(); };
   window.getSyncCode = function () { return syncCode; };
 
-  /* ---------- 包装写入：记录本地时间 + 推送 ---------- */
   var _setItem = localforage.setItem.bind(localforage);
   var _removeItem = localforage.removeItem.bind(localforage);
 
@@ -76,32 +69,21 @@
   function schedulePush(key, value, ts) {
     clearTimeout(pushTimers[key]);
     pushTimers[key] = setTimeout(function () {
-      client.from(TABLE).upsert(
-        { sync_code: syncCode, k: key, v: (value === undefined ? null : value), updated_at: ts },
-        { onConflict: 'sync_code,k' }
-      ).then(function (r) { if (r.error) console.warn('[cloud-sync] 推送失败', key, r.error.message); });
+      doUpsert(key, value, ts);
     }, 800);
   }
-
-  async function pushKeys(keys) {
-    var batch = [];
-    for (var i = 0; i < keys.length; i++) {
-      var v = await localforage.getItem(keys[i]);
-      batch.push({ sync_code: syncCode, k: keys[i], v: (v == null ? null : v), updated_at: meta[keys[i]] || nowIso() });
-    }
-    for (var j = 0; j < batch.length; j += 40) {
-      var r = await client.from(TABLE).upsert(batch.slice(j, j + 40), { onConflict: 'sync_code,k' });
-      if (r.error) console.warn('[cloud-sync] 批量推送失败', r.error.message);
-    }
+  function doUpsert(key, value, ts) {
+    return client.from(TABLE).upsert(
+      { sync_code: syncCode, k: key, v: (value === undefined ? null : value), updated_at: ts },
+      { onConflict: 'sync_code,k' }
+    ).then(function (r) {
+      if (r.error) { console.warn('[cloud-sync] 推送失败', key, r.error.message); showResultToast('上传失败：' + r.error.message); }
+    });
   }
 
-  /* ---------- 安全合并：谁新用谁，绝不用旧数据覆盖新数据 ---------- */
-  async function syncMerge() {
+  async function pull() {
     if (!syncCode) return;
     var localKeys = (await localforage.keys()).filter(syncable);
-
-    // 升级后第一次：给没有时间戳的本地键标成“现在”，
-    // 这样本地数据被视为最新——会被推上去，而不会被云端旧数据覆盖。
     var changed = false;
     for (var i = 0; i < localKeys.length; i++) {
       if (!meta[localKeys[i]]) { meta[localKeys[i]] = nowIso(); changed = true; }
@@ -112,13 +94,11 @@
     if (res.error) { console.warn('[cloud-sync] 拉取失败', res.error.message); return; }
     var rows = res.data || [];
     var cloudMap = {};
-
     applyingRemote = true;
     for (var r = 0; r < rows.length; r++) {
-      var row = rows[r];
-      cloudMap[row.k] = row.updated_at;
+      var row = rows[r]; cloudMap[row.k] = row.updated_at;
       var localTs = meta[row.k] || '';
-      if (row.updated_at > localTs) {            // 仅当云端严格更新才覆盖本地
+      if (row.updated_at > localTs) {
         try { await _setItem(row.k, row.v); } catch (e) {}
         meta[row.k] = row.updated_at;
       }
@@ -126,7 +106,6 @@
     applyingRemote = false;
     saveMeta();
 
-    // 本地比云端新（或云端没有）的键，补推上去
     var toPush = [];
     for (var x = 0; x < localKeys.length; x++) {
       var lk = localKeys[x], cTs = cloudMap[lk];
@@ -135,30 +114,60 @@
     if (toPush.length) { try { await pushKeys(toPush); } catch (e) {} }
     console.log('[cloud-sync] 合并完成：云端 ' + rows.length + ' 项，本地补推 ' + toPush.length + ' 项');
   }
-  window.cloudSyncMerge = syncMerge;
+  window.cloudSyncMerge = pull;
 
-  // 强制把本机数据设为“最新”并全部推上云（用于指定某台为数据源）
-  window.cloudSyncPushAll = async function () {
-    var ks = (await localforage.keys()).filter(syncable);
-    var t = nowIso();
-    for (var i = 0; i < ks.length; i++) meta[ks[i]] = t;
-    saveMeta();
-    await pushKeys(ks);
-    console.log('[cloud-sync] 已强制上传本地 ' + ks.length + ' 项');
-  };
+  async function pushKeys(keys, forceTs) {
+    var batch = [];
+    for (var i = 0; i < keys.length; i++) {
+      var v = await localforage.getItem(keys[i]);
+      batch.push({ sync_code: syncCode, k: keys[i], v: (v == null ? null : v), updated_at: forceTs || meta[keys[i]] || nowIso() });
+    }
+    var failed = 0, firstErr = '';
+    for (var j = 0; j < batch.length; j += 40) {
+      var r = await client.from(TABLE).upsert(batch.slice(j, j + 40), { onConflict: 'sync_code,k' });
+      if (r.error) { failed++; if (!firstErr) firstErr = r.error.message; }
+    }
+    return { count: batch.length, failed: failed, firstErr: firstErr };
+  }
 
-  /* ---------- 启动：合并（不再是覆盖） ---------- */
+  // 强制把本机所有数据上传（手动按钮用），返回可显示的结果文字
+  async function forcePushVisible() {
+    if (!syncCode) return '没有同步码，无法上传（请先设置 jlin47）';
+    try {
+      var ks = (await localforage.keys()).filter(syncable);
+      if (!ks.length) return '本机没有可上传的数据';
+      var t = nowIso();
+      for (var i = 0; i < ks.length; i++) meta[ks[i]] = t;
+      saveMeta();
+      var r = await pushKeys(ks, t);
+      if (r.failed) return '上传失败：' + r.firstErr;
+      return '已上传 ' + r.count + ' 项 ✅ 去另一台刷新即可';
+    } catch (e) { return '上传出错：' + (e && e.message ? e.message : e); }
+  }
+  window.cloudSyncPushAll = forcePushVisible;
+
   if (typeof window.initializeSession === 'function') {
     var _origInit = window.initializeSession;
     window.initializeSession = async function () {
       ensureSyncCode();
-      try { await syncMerge(); } catch (e) { console.warn('[cloud-sync] 合并异常', e); }
+      try { await pull(); } catch (e) { console.warn('[cloud-sync] 合并异常', e); }
       return _origInit.apply(this, arguments);
     };
   }
 
-  /* ---------- 切回页面：云端更新时弹提示（不强制刷新，避免打断你输入） ---------- */
-  window.addEventListener('DOMContentLoaded', function () { setTimeout(function () { booted = true; }, 4000); });
+  // 切到后台：立刻把待发送的改动推一次（尽量别被手机锁屏掐断）
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden') {
+      for (var k in pushTimers) { clearTimeout(pushTimers[k]); }
+      if (syncCode) { try { forcePushVisible(); } catch (e) {} }
+    }
+  });
+
+  // 切回前台：若云端更新则提示
+  window.addEventListener('DOMContentLoaded', function () {
+    setTimeout(function () { booted = true; }, 4000);
+    injectSyncButton();
+  });
   document.addEventListener('visibilitychange', async function () {
     if (document.visibilityState !== 'visible' || !booted || !syncCode) return;
     try {
@@ -172,6 +181,25 @@
     } catch (e) {}
   });
 
+  function injectSyncButton() {
+    if (document.getElementById('cloud-sync-btn')) return;
+    var b = document.createElement('div');
+    b.id = 'cloud-sync-btn';
+    b.textContent = '☁';
+    b.title = '立即同步上传';
+    b.style.cssText = 'position:fixed;right:14px;bottom:96px;z-index:99998;width:44px;height:44px;'
+      + 'border-radius:50%;background:rgba(180,150,90,.92);color:#fff;font-size:20px;display:flex;'
+      + 'align-items:center;justify-content:center;box-shadow:0 3px 10px rgba(0,0,0,.3);cursor:pointer;'
+      + '-webkit-user-select:none;user-select:none;';
+    b.onclick = async function () {
+      b.textContent = '⏳';
+      var msg = await forcePushVisible();
+      b.textContent = '☁';
+      showResultToast(msg);
+    };
+    document.body.appendChild(b);
+  }
+
   function showSyncToast() {
     if (document.getElementById('cloud-sync-toast')) return;
     var t = document.createElement('div');
@@ -183,6 +211,19 @@
     t.onclick = function () { location.reload(); };
     document.body.appendChild(t);
     setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 10000);
+  }
+
+  function showResultToast(msg) {
+    var old = document.getElementById('cloud-sync-result');
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+    var t = document.createElement('div');
+    t.id = 'cloud-sync-result';
+    t.textContent = msg;
+    t.style.cssText = 'position:fixed;left:50%;bottom:150px;transform:translateX(-50%);z-index:100000;'
+      + 'max-width:80%;text-align:center;background:rgba(0,0,0,.88);color:#fff;padding:12px 18px;'
+      + 'border-radius:14px;font-size:14px;line-height:1.5;box-shadow:0 4px 16px rgba(0,0,0,.35)';
+    document.body.appendChild(t);
+    setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 6000);
   }
 
 })();
